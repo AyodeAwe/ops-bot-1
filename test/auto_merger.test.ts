@@ -643,7 +643,63 @@ URL: https://github.com/rapidsai/cudf/pull/6775`,
       expect(result.message).toContain("Validation successful");
     });
 
-    test("should succeed when all validation passes on old pattern", async () => {
+    test("should succeed with UCX-style version numbers", async () => {
+      const pr = {
+        ...makePullResponse().data,
+        head: { ref: "branch-0.41-merge-branch-0.40" },
+        base: { ref: "branch-0.41" },
+        number: 5678
+      } as unknown as PullsGetResponseData;
+      const comments: any[] = [];
+      mockSearchIssuesAndPullRequests.mockResolvedValueOnce({
+        data: {
+          items: [{ number: 1234 }]
+        }
+      });
+      mockPullsGet.mockResolvedValueOnce({
+        data: {
+          ...makePullResponse().data,
+          user: { login: "rapids-bot[bot]" },
+          base: { ref: "branch-0.41" }
+        }
+      });
+      
+      // Original PR commits
+      mockPaginate.mockResolvedValueOnce([
+        { sha: "commit1" },
+        { sha: "commit2" }
+      ]);
+      
+      // Current PR commits - includes all original commits
+      mockPaginate.mockResolvedValueOnce([
+        { sha: "commit1" },
+        { sha: "commit2" },
+        { sha: "commit3" } // Extra commit is fine
+      ]);
+
+      const result = await autoMerger.validateNoSquashMerge(pr, comments);
+      
+      expect(result.success).toBe(true);
+      expect(result.message).toContain("Validation successful");
+    });
+
+    test("should fail with invalid version number format", async () => {
+      const pr = {
+        ...makePullResponse().data,
+        head: { ref: "branch-0.5-merge-branch-0.4" }, // Single digit after decimal
+        base: { ref: "branch-0.5" },
+        number: 5678
+      } as unknown as PullsGetResponseData;
+      const comments: any[] = [];
+
+      const result = await autoMerger.validateNoSquashMerge(pr, comments);
+      
+      expect(result.success).toBe(false);
+      expect(result.message).toContain("Could not determine original ForwardMerger PR from branch name");
+      expect(result.isFixableError).toBe(true);
+    });
+
+    test("should succeed with RAPIDS-style version numbers", async () => {
       const pr = {
         ...makePullResponse().data,
         head: { ref: "branch-25.06-merge-25.04" },

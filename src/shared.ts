@@ -97,7 +97,7 @@ export const isManualForwardMergeBranch = (branchName: string): boolean => {
  */
 export const parseManualForwardMergeBranch = (branchName: string): { source: string; target: string } | null => {
   const MAIN_FORWARD_MERGE_RELEASE_BRANCH_REGEX = /^(?<target>main)-merge-(?<source>release\/\d\d\.\d\d)$/;
-  const BRANCH_FORWARD_MERGE_BRANCH_REGEX = /^branch-(?<targetVersion>\d\d\.\d\d)-merge(?:-branch)?-(?<sourceVersion>\d\d\.\d\d)$/;
+  const BRANCH_FORWARD_MERGE_BRANCH_REGEX = /^branch-(?<targetVersion>\d{1,2}\.\d\d)-merge(?:-branch)?-(?<sourceVersion>\d{1,2}\.\d\d)$/;
   const trimmedBranchName = branchName.trim();
   let match = BRANCH_FORWARD_MERGE_BRANCH_REGEX.exec(trimmedBranchName);
 
