@@ -19,6 +19,7 @@ import {
   CommitStatus,
   IssueCommentContext,
   IssuesCommentsResponseData,
+  MergeCommentResult,
   PRContext,
   ProbotOctokit,
   PullRequestLike,
@@ -30,25 +31,13 @@ export const Permission = {
   maintain: "maintain",
 };
 
-export const Command = {
-  OkToTest: new RegExp("^/ok(ay)? to test$"),
-  Merge: new RegExp("^/merge$"),
-  OldMerge: new RegExp("^@gpucibot merge$"),
-};
-
-/**
- * RegEx representing RAPIDS branch name patterns
- * (i.e. "branch-21.06", "branch-22.08", etc.)
- */
-export const versionedBranchExp = /^branch-\d\d\.\d\d$/;
-
 /**
  * Returns true if the provided string is a versioned branch
  * (i.e. "branch-21.06", "branch-22.08", etc.)
  * @param branchName
  */
 export const isVersionedBranch = (branchName: string): boolean => {
-  return Boolean(branchName.match(versionedBranchExp));
+  return Boolean(branchName.match(/^branch-\d\d\.\d\d$/));
 };
 
 /**
@@ -66,6 +55,67 @@ export const isVersionedUCXBranch = (branchName: string): boolean => {
  */
 export const getVersionFromBranch = (branchName: string): string => {
   return branchName.split("-")[1];
+};
+
+/**
+ * Parses a merge comment to determine if it's a valid command and the intended merge method.
+ * Handles "/merge" and "/merge nosquash".
+ * @param commentText The comment string.
+ * @returns An object with `isMergeComment` (boolean) and `method` ("squash" | "merge" | null).
+ */
+export const parseMergeComment = (commentText: string): MergeCommentResult => {
+  const trimmedComment = commentText.trim();
+  const result = /^\/merge(?: (?<method>nosquash))?$/.exec(trimmedComment);
+
+  if (result) {
+    const method = result.groups!.method ? "merge" : "squash";
+    return {
+      isMergeComment: true,
+      method,
+    };
+  }
+
+  return {
+    isMergeComment: false,
+    method: null
+  };
+};
+
+/**
+ * Returns true if the provided branch name follows a recognized manual forward-merge naming convention.
+ * @param branchName
+ */
+export const isManualForwardMergeBranch = (branchName: string): boolean => {
+  return Boolean(parseManualForwardMergeBranch(branchName));
+};
+
+/**
+ * Parses a manual forward-merge branch name to extract source and target branches.
+ * Handles patterns like "branch-YY.MM-merge-branch-YY.MM", "branch-YY.MM-merge-YY.MM", and "main-merge-release/YY.MM".
+ * @param branchName The branch name string.
+ * @returns Object with source and target branch names (full names), or null if not a recognized forward-merge branch name.
+ */
+export const parseManualForwardMergeBranch = (branchName: string): { source: string; target: string } | null => {
+  const MAIN_FORWARD_MERGE_RELEASE_BRANCH_REGEX = /^(?<target>main)-merge-(?<source>release\/\d\d\.\d\d)$/;
+  const BRANCH_FORWARD_MERGE_BRANCH_REGEX = /^branch-(?<targetVersion>\d\d\.\d\d)-merge(?:-branch)?-(?<sourceVersion>\d\d\.\d\d)$/;
+  const trimmedBranchName = branchName.trim();
+  let match = BRANCH_FORWARD_MERGE_BRANCH_REGEX.exec(trimmedBranchName);
+
+  if (match?.groups?.targetVersion && match?.groups?.sourceVersion) {
+    return {
+      target: `branch-${match.groups.targetVersion}`,
+      source: `branch-${match.groups.sourceVersion}`
+    };
+  }
+
+  match = MAIN_FORWARD_MERGE_RELEASE_BRANCH_REGEX.exec(trimmedBranchName);
+  if (match?.groups?.target && match?.groups?.source) {
+    return {
+      target: match.groups.target, // e.g. "main"
+      source: match.groups.source  // e.g. "release/25.04"
+    };
+  }
+  return null;
 };
 
 /**
@@ -113,6 +163,12 @@ export const isRapidsBotPR = (
   return pullRequest.user?.login.toLowerCase() === "rapids-bot[bot]";
 };
 
+export const isOpsBotTestingPR = (
+  pullRequest: PullRequestLike
+): boolean => {
+  return pullRequest.user?.login.toLowerCase() === "ops-bot-testing[bot]";
+};
+
 /**
  * Returns true if the payload associated with the provided context
  * is from a GitHub Pull Request (as opposed to a GitHub Issue).
@@ -120,22 +176,6 @@ export const isRapidsBotPR = (
  */
 export const issueIsPR = (context: IssueCommentContext): boolean => {
   return "pull_request" in context.payload.issue;
-};
-
-/**
- * Returns true if the given comment is the merge comment string.
- * @param comment
- */
-export const isMergeComment = (comment: string): boolean => {
-  return Boolean(comment.trim().match(Command.Merge));
-};
-
-/**
- * Returns true if the given comment is the old merge comment string.
- * @param comment
- */
-export const isOldMergeComment = (comment: string): boolean => {
-  return Boolean(comment.trim().match(Command.OldMerge));
 };
 
 /**

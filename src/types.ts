@@ -57,3 +57,7 @@ export type CommitStatus = {
 };
 
 export type PullRequestLike = Pick<PullsGetResponseData, "user"> | PRContext["payload"]["pull_request"] | PullsListResponseData[0];
+
+export type MergeCommentResult =
+  | { isMergeComment: true; method: "merge" | "squash" }
+  | { isMergeComment: false; method: null };

@@ -18,18 +18,27 @@ import {
   AutoMergerContext,
   PullsGetResponseData,
   UsersGetByUsernameResponseData,
+  IssuesCommentsResponseData,
 } from "../../types.ts";
 import strip from "strip-comments";
 import {
-  isMergeComment,
   Permission,
-  validCommentsExistByPredicate,
+  isManualForwardMergeBranch,
+  parseManualForwardMergeBranch,
+  isRapidsBotPR,
+  isGPUTesterPR,
+  isOpsBotTestingPR,
+  parseMergeComment,
 } from "../../shared.ts";
 import { OpsBotPlugin } from "../../plugin.ts";
 import { PRNumberResolver } from "./resolve_prs.ts";
 
 export class AutoMerger extends OpsBotPlugin {
   public context: AutoMergerContext;
+  private static readonly NOSQUASH_VALIDATION_FAILURE_PREFIX = "This PR has failed nosquash validation checks:";
+  private static readonly CMD_MERGE = "/merge";
+  private static readonly CMD_MERGE_NOSQUASH = "/merge nosquash";
+
   constructor(context: AutoMergerContext) {
     super("auto_merger", context);
     this.context = context;
@@ -61,34 +70,341 @@ export class AutoMerger extends OpsBotPlugin {
         return;
       }
 
-      // Check if PR has valid merge comment
-      if (
-        !(await validCommentsExistByPredicate(
-          this.context,
-          pr.number,
-          [Permission.admin, Permission.write, Permission.maintain],
-          (comment) => isMergeComment(comment.body || "")
-        ))
-      ) {
-        this.logger.info("no merge comment on PR");
+      // Fetch all comments once to avoid duplicate API calls
+      const allComments = await this.context.octokit.paginate(
+        this.context.octokit.issues.listComments,
+        {
+          owner: repo.owner.login,
+          repo: repo.name,
+          issue_number: pr.number,
+          per_page: 100,
+        }
+      );
+
+      // Check if PR has valid merge comment and determine merge method
+      const mergeCommentResult = await this.getValidMergeComment(pr, allComments);
+      if (!mergeCommentResult) {
+        this.logger.info("no valid merge comment on PR");
         return;
       }
 
-      // Generate commit message
-      const commitMsg = await this.createCommitMessage(pr);
+      const { mergeMethod, commentBody } = mergeCommentResult;
+      this.logger.info(
+        `mergeCommentResult is ${mergeMethod} for comment: "${commentBody}"`
+      );
+
+      // Additional validation for bot PRs and manual forward-merge PRs
+      if (!await this.validateMergeRequest(pr, mergeMethod)) {
+        return;
+      }
+
+      // For nosquash (merge commit) merges, we need to validate additional criteria
+      if (mergeMethod === "merge") {
+        try {
+          const validationResult = await this.validateNoSquashMerge(pr, allComments);
+          if (!validationResult.success) {
+            // Add a specific message prefix for non-fixable failures to enable lockout detection
+            if (!validationResult.isFixableError) {
+              await this.issueComment(
+                pr.number, 
+                `${AutoMerger.NOSQUASH_VALIDATION_FAILURE_PREFIX} ${validationResult.message}`
+              );
+            } else {
+              // For fixable errors, just post the message without the prefix that triggers lockout
+              await this.issueComment(pr.number, validationResult.message);
+            }
+            
+            return;
+          }
+        } catch (error) {
+          this.logger.error({ error }, "Error validating nosquash merge");
+          await this.issueComment(
+            pr.number, 
+            "Error validating this PR for a non-squash merge. Please contact `@rapidsdevops` on Slack for assistance."
+          );
+          return;
+        }
+      }
+
+      // For squash merges, generate commit message
+      let commitTitle: string | undefined;
+      let commitMsg: string | undefined;
+      
+      if (mergeMethod === "squash") {
+        commitMsg = await this.createCommitMessage(pr);
+        commitTitle = `${pr.title.trim()} (#${pr.number})`;
+      }
 
       // Merge PR
-      this.logger.info({ pr }, "merging PR");
-      const commitTitle = `${pr.title.trim()} (#${pr.number})`;
-      await context.octokit.pulls.merge({
+      this.logger.info({ pr, mergeMethod }, "merging PR");
+      try {
+        await context.octokit.pulls.merge({
+          owner: repo.owner.login,
+          repo: repo.name,
+          pull_number: pr.number,
+          merge_method: mergeMethod,
+          commit_title: commitTitle,
+          commit_message: commitMsg,
+        });
+      } catch (error: any) {
+        this.logger.error({ error }, "Error merging PR");
+        await this.issueComment(
+          pr.number,
+          `Failed to merge PR using ${mergeMethod} strategy.`
+        );
+        return;
+      }
+    }
+  }
+
+  /**
+   * Validate whether a merge command should be processed on this PR
+   */
+  async validateMergeRequest(
+    pr: PullsGetResponseData,
+    mergeMethod: "squash" | "merge"
+  ): Promise<boolean> {
+    // Reject any merge command on bot-authored PRs
+    if (isRapidsBotPR(pr) || isGPUTesterPR(pr)) {
+      await this.issueComment(
+        pr.number,
+        `AutoMerger commands (like \`${AutoMerger.CMD_MERGE}\` or \`${AutoMerger.CMD_MERGE_NOSQUASH}\`) cannot be used directly on PRs authored by RAPIDS bots. ` +
+        "To resolve conflicts from a failed forward-merge, please create a new, separate pull request with the resolved changes, " +
+        `then use \`${AutoMerger.CMD_MERGE_NOSQUASH}\` on that new PR.`
+      );
+      return false;
+    }
+
+    // Reject `/merge` (squash) on manual forward-merge resolution PRs
+    const branchName = pr.head?.ref || "";
+    if (mergeMethod === "squash" && isManualForwardMergeBranch(branchName)) {
+      await this.issueComment(
+        pr.number,
+        "This PR appears to be a manual resolution for a forward-merge. Such PRs must use a non-squash merge strategy " +
+        `to preserve commit history. Please use the \`${AutoMerger.CMD_MERGE_NOSQUASH}\` command instead.`
+      );
+      return false;
+    }
+
+    return true;
+  }
+
+  /**
+   * Get a valid merge comment from the PR and determine the merge method
+   * Processes comments from newest to oldest so the most recent command takes precedence
+   */
+  async getValidMergeComment(pr: PullsGetResponseData, allComments: IssuesCommentsResponseData): Promise<{ mergeMethod: "squash" | "merge", commentBody: string } | null> {
+    const { repository: repo } = this.context.payload;
+    
+    // Filter for merge comments using the new parseMergeComment
+    const mergeComments = allComments.filter((comment) =>
+      parseMergeComment(comment.body || "").isMergeComment
+    );
+    
+    // Sort comments by creation time, newest first
+    mergeComments.sort(
+      (a, b) =>
+        new Date(b.created_at || 0).getTime() -
+        new Date(a.created_at || 0).getTime()
+    );
+
+    // Check if there are any valid merge comments by users with appropriate permissions
+    // Processing from newest to oldest
+    for (const comment of mergeComments) {
+      const userPermission = await this.context.octokit.repos.getCollaboratorPermissionLevel({
+        owner: repo.owner.login,
+        repo: repo.name,
+        username: comment.user?.login as string,
+      });
+
+      const requiredPermissions = [
+        Permission.admin,
+        Permission.write,
+        Permission.maintain,
+      ];
+      if (requiredPermissions.includes(userPermission.data.permission)) {
+        const commentBody = comment.body || "";
+        const parsedComment = parseMergeComment(commentBody);
+        if (parsedComment.isMergeComment) {
+          this.logger.info(
+            `Using merge command from comment ${comment.html_url} created at ${comment.created_at}: ${commentBody} (method: ${parsedComment.method})`
+          );
+          return { mergeMethod: parsedComment.method, commentBody };
+        }
+      }
+    }
+
+    return null;
+  }
+
+  /**
+   * Validates a PR for a nosquash merge
+   * @param pr The pull request to validate
+   * @returns An object with success status and message
+   */
+  async validateNoSquashMerge(pr: PullsGetResponseData, allComments: IssuesCommentsResponseData): Promise<{ 
+    success: boolean; 
+    message: string; 
+    isFixableError?: boolean;
+  }> {
+    this.logger.info("Validating no squash merge PR:", pr)
+    const { repository: repo } = this.context.payload;
+    
+    // Check if PR has a permanent lockout from previous validation failures
+    if (this.hasPermanentNosquashValidationFailure(allComments)) {
+      return { 
+        success: false, 
+        message: "This PR has previously failed nosquash validation checks. Please contact `@rapidsdevops` on Slack for assistance.",
+        isFixableError: false
+      };
+    }
+
+    // Parse branch name to identify source/target branches
+    const branchName = pr.head?.ref || "";
+    const parsedBranch = parseManualForwardMergeBranch(branchName);
+    
+    if (!parsedBranch) {
+      return { 
+        success: false, 
+        message: "Could not determine original ForwardMerger PR from branch name. The branch name should follow the pattern " + 
+        "`<target_branch>-merge-<source_branch>` (e.g., `branch-25.06-merge-branch-25.04` or `main-merge-release/25.06`). " +
+        "Please contact `@rapidsdevops` on Slack for assistance.",
+        isFixableError: true
+      };
+    }
+    
+    // Search for original forward-merger PR
+    const sourceBranch = parsedBranch.source;
+    const targetBranch = parsedBranch.target;
+    
+    const { data: searchResults } = await this.context.octokit.search.issuesAndPullRequests({
+      q: (`repo:${repo.full_name} is:pr is:open head:${sourceBranch} base:${targetBranch} author:app/rapids-bot author:app/ops-bot-testing`),
+    });
+    
+    if (searchResults.items.length === 0) {
+      return {
+        success: false, 
+        message: `Could not find any open bot-authored PRs from ${sourceBranch} to ${targetBranch}. ` + 
+                "Please contact `@rapidsdevops` on Slack for assistance." 
+      };
+    }
+    
+    if (searchResults.items.length > 1) {
+      return {
+        success: false, 
+        message: `Found multiple (${searchResults.items.length}) open bot-authored PRs from ${sourceBranch} to ${targetBranch}. ` + 
+                "Cannot uniquely identify which PR this is resolving. Please contact `@rapidsdevops` on Slack for assistance." 
+      };
+    }
+    
+    // We found exactly one matching PR
+    const originalPrNumber = searchResults.items[0].number;
+    
+    // Fetch full details of the original PR
+    const { data: originalPr } = await this.context.octokit.pulls.get({
+      owner: repo.owner.login,
+      repo: repo.name,
+      pull_number: originalPrNumber,
+    });
+    
+    // Validate original PR author
+    if (!isRapidsBotPR(originalPr) && !isGPUTesterPR(originalPr) && !isOpsBotTestingPR(originalPr)) {
+      return { 
+        success: false, 
+        message: `Original PR #${originalPrNumber} was not authored by a known bot account. ` + 
+                "Please contact `@rapidsdevops` on Slack for assistance." 
+      };
+    }
+    
+    // Base branch consistency check
+    if (pr.base.ref !== originalPr.base.ref) {
+      return { 
+        success: false, 
+        message: `Base branch of this PR (${pr.base.ref}) does not match the base branch of original PR #${originalPrNumber} (${originalPr.base.ref}). ` + 
+                "Please correct the base branch and try again.",
+        isFixableError: true // Mark as fixable error that doesn't cause lockout
+      };
+    }
+    
+    // Commit history integrity validation
+    const originalCommits = await this.context.octokit.paginate(
+      this.context.octokit.pulls.listCommits,
+      {
+        owner: repo.owner.login,
+        repo: repo.name,
+        pull_number: originalPrNumber,
+        per_page: 100,
+      }
+    );
+    
+    const originalCommitShas = originalCommits.map(commit => commit.sha);
+    
+    if (originalCommitShas.length === 0) {
+      return { 
+        success: false, 
+        message: `Original PR #${originalPrNumber} unexpectedly has no commits. Cannot validate commit history integrity. ` + 
+                "Please contact `@rapidsdevops` on Slack for assistance." 
+      };
+    }
+    
+    const currentPrCommits = await this.context.octokit.paginate(
+      this.context.octokit.pulls.listCommits,
+      {
         owner: repo.owner.login,
         repo: repo.name,
         pull_number: pr.number,
-        merge_method: "squash",
-        commit_title: commitTitle,
-        commit_message: commitMsg,
-      });
+        per_page: 100,
+      }
+    );
+    
+    const currentPrCommitShas = currentPrCommits.map(commit => commit.sha);
+    
+    // Check if all original commits are present in current PR
+    const missingCommits = originalCommitShas.filter(sha => !currentPrCommitShas.includes(sha));
+    
+    if (missingCommits.length > 0) {
+      return { 
+        success: false, 
+        message: `Commit history integrity check failed: not all commits from original PR #${originalPrNumber} ` + 
+                "appear to be present individually in this PR's history. This usually happens if commits were squashed " + 
+                "during the manual resolution process. Please ensure all original commits are preserved individually. " + 
+                `You can fix this and try the \`${AutoMerger.CMD_MERGE_NOSQUASH}\` command again.`,
+        isFixableError: true
+      };
     }
+    
+    // All validations passed
+    return { 
+      success: true, 
+      message: `Validation successful. Proceeding with non-squash merge of PR #${pr.number}.` 
+    };
+  }
+
+  /**
+   * Checks if this PR has a previous permanent validation failure 
+   * that should prevent further nosquash merge attempts.
+   * 
+   * Note: Fixable errors (like commit history or base branch issues) don't cause lockout
+   */
+  private hasPermanentNosquashValidationFailure(comments: IssuesCommentsResponseData): boolean {
+    return comments.some(comment => {
+      const isPermanentFailureFormat = (comment.body || "").includes(AutoMerger.NOSQUASH_VALIDATION_FAILURE_PREFIX);
+      
+      return isPermanentFailureFormat;
+    });
+  }
+
+  /**
+   * Post a comment on an issue/PR
+   */
+  async issueComment(prNumber: number, message: string): Promise<void> {
+    const { repository: repo } = this.context.payload;
+    await this.context.octokit.issues.createComment({
+      owner: repo.owner.login,
+      repo: repo.name,
+      issue_number: prNumber,
+      body: message,
+    });
   }
 
   /**
@@ -189,6 +505,7 @@ export class AutoMerger extends OpsBotPlugin {
       owner: pr.base.repo.owner.login,
       repo: pr.base.repo.name,
       pull_number: pr.number,
+      per_page: 100,
     });
 
     for (let i = 0; i < commits.length; i++) {
@@ -227,6 +544,7 @@ export class AutoMerger extends OpsBotPlugin {
       owner: pr.base.repo.owner.login,
       repo: pr.base.repo.name,
       pull_number: pr.number,
+      per_page: 100,
     });
     const approvers = reviewers.filter((review) => review.state === "APPROVED");
 
