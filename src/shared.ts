@@ -33,11 +33,11 @@ export const Permission = {
 
 /**
  * Returns true if the provided string is a versioned branch
- * (i.e. "branch-21.06", "branch-22.08", etc.)
+ * (i.e. "branch-21.06", "release/22.08", etc.)
  * @param branchName
  */
 export const isVersionedBranch = (branchName: string): boolean => {
-  return Boolean(branchName.match(/^branch-\d\d\.\d\d$/));
+  return /^(branch-|release\/)\d{2}\.\d{2}$/.test(branchName);
 };
 
 /**
@@ -52,9 +52,14 @@ export const isVersionedUCXBranch = (branchName: string): boolean => {
 
 /**
  * Returns the RAPIDS version from a versioned branch name
+ * (e.g. "branch-22.06" -> "22.06", "release/22.08" -> "22.08")
  */
 export const getVersionFromBranch = (branchName: string): string => {
-  return branchName.split("-")[1];
+  const match = branchName.match(/\d{2}\.\d{2}/);
+  if (match) {
+    return match[0];
+  }
+  return "";
 };
 
 /**

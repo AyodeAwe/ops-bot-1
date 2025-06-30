@@ -68,7 +68,10 @@ export class ReleaseDrafter extends OpsBotPlugin {
 
     this.logger.info("drafting release");
 
-    const prs = await this.getPRsFromBranch();
+    const prs =
+      this.defaultBranch === "main"
+        ? await this.getPRsForNewStrategy()
+        : await this.getPRsForLegacyStrategy();
     const releaseDraftBody = this.getReleaseDraftBody(prs);
     const releaseId = await this.getExistingDraftReleaseId();
     await this.createOrUpdateDraftRelease(releaseId, releaseDraftBody);
@@ -76,16 +79,12 @@ export class ReleaseDrafter extends OpsBotPlugin {
 
   /**
    * Returns true if the branch name is valid. Valid branches should match
-   * the branch-yy.mm pattern and have a version that's the same as the repo's
-   * default branch or branches one or two versions before to account
-   * for burndown & code-freeze.
+   * the branch-yy.mm or release/yy.mm pattern and exist in releases.json
    */
   async isValidBranch(): Promise<boolean> {
     if (!isVersionedBranch(this.branchName)) return false;
     const { branchVersionNumber } = this;
-    const defaultBranchVersionNumber = getVersionFromBranch(this.defaultBranch);
 
-    if (defaultBranchVersionNumber === branchVersionNumber) return true;
     const { data: json } = await axios.get<{
       legacy: { version };
       stable: { version };
@@ -102,10 +101,87 @@ export class ReleaseDrafter extends OpsBotPlugin {
   }
 
   /**
+   * (New Strategy)
+   * Returns all PRs for a release by inspecting the git history between the
+   * release's alpha tag and the current HEAD of the release branch.
+   */
+  async getPRsForNewStrategy(): Promise<PullsListResponseData> {
+    const { context, repo, branchName, branchVersionNumber } = this;
+    const owner = repo.owner.login;
+    const repoName = repo.name;
+    const startTag = `v${branchVersionNumber}.00a`;
+
+    // 1. Get commits between the start tag and the release branch HEAD
+    let commits: { commit: { message: string } }[] = [];
+    try {
+      const { data } = await context.octokit.repos.compareCommits({
+        owner,
+        repo: repoName,
+        base: startTag,
+        head: branchName,
+      });
+      commits = data.commits;
+    } catch (e) {
+      this.logger.error(
+        e,
+        `Failed to compare commits between ${startTag} and ${branchName}`
+      );
+      return [];
+    }
+
+    // 2. Extract PR numbers from squash-merge commits
+    const prNumbers = new Set<number>();
+    const prRegex = /\(#(\d+)\)/;
+    for (const commit of commits) {
+      const match = commit.commit.message.match(prRegex);
+      if (match && match[1]) {
+        prNumbers.add(parseInt(match[1], 10));
+      }
+    }
+
+    // 3. Get PRs that were merged directly into the release branch
+    const directMergePrs = await context.octokit.paginate(
+      context.octokit.pulls.list,
+      {
+        owner,
+        repo: repoName,
+        base: branchName,
+        state: "closed",
+        per_page: 100,
+      }
+    );
+    directMergePrs
+      .filter((pr) => pr.merged_at)
+      .forEach((pr) => prNumbers.add(pr.number));
+
+    // 4. Fetch full PR objects for all unique PR numbers
+    const prPromises = Array.from(prNumbers).map((prNumber) =>
+      context.octokit.pulls
+        .get({
+          owner,
+          repo: repoName,
+          pull_number: prNumber,
+        })
+        .then((response) => response.data)
+        .catch((e) => {
+          this.logger.error(e, `Failed to fetch PR #${prNumber}`);
+          return null;
+        })
+    );
+
+    const prs = (await Promise.all(prPromises)).filter(
+      (pr) => pr !== null
+    ) as PullsListResponseData;
+
+    return prs;
+  }
+
+  /**
+   * (Legacy Strategy)
    * Returns all non-forward-merger PRs that have been merged into
    * the repo's base branch.
    */
-  async getPRsFromBranch(): Promise<PullsListResponseData> {
+  async getPRsForLegacyStrategy(): Promise<PullsListResponseData> {
     const { context, repo, branchName } = this;
 
     const prs = await context.octokit.paginate(context.octokit.pulls.list, {
